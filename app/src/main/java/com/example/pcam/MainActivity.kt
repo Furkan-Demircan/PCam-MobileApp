@@ -35,6 +35,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.background
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.material3.Text
+import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
@@ -43,6 +50,9 @@ import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.content.Context
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
@@ -95,6 +105,23 @@ fun CameraScreen() {
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
     val previewView = remember { PreviewView(context) }
 
+    var lensFacing by remember { mutableStateOf(CameraSelector.LENS_FACING_BACK) }
+    var activeCamera by remember { mutableStateOf<androidx.camera.core.Camera?>(null) }
+    var isClientConnected by remember { mutableStateOf(false) }
+
+    val activity = LocalContext.current as? android.app.Activity
+    LaunchedEffect(isClientConnected) {
+        activity?.window?.let { window ->
+            val params = window.attributes
+            if (isClientConnected) {
+                params.screenBrightness = 0.01f
+            } else {
+                params.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+            window.attributes = params
+        }
+    }
+
     // H.264 encoder settings
     val ENCODER_WIDTH = 1280
     val ENCODER_HEIGHT = 720
@@ -108,6 +135,10 @@ fun CameraScreen() {
     val sendQueue = remember { LinkedBlockingDeque<ByteArray>(48) }
     val senderRunning = remember { AtomicBoolean(false) }
     var senderThread by remember { mutableStateOf<Thread?>(null) }
+    
+    // NsdManager variables
+    val nsdManager = remember { context.getSystemService(Context.NSD_SERVICE) as NsdManager }
+    var registrationListener by remember { mutableStateOf<NsdManager.RegistrationListener?>(null) }
 
     // helper to build a single byte[] containing header (rotation,int) + size(int) + jpeg bytes
     fun makeQueuedFrame(rotation: Int, jpegData: ByteArray): ByteArray {
@@ -121,6 +152,34 @@ fun CameraScreen() {
     }
 
     LaunchedEffect(Unit) {
+        // Register NSD service
+        val serviceInfo = NsdServiceInfo().apply {
+            serviceName = "PCam"
+            serviceType = "_pcam._tcp."
+            port = 8080
+        }
+        
+        registrationListener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(info: NsdServiceInfo) {
+                Log.d("NsdManager", "Service registered: ${info.serviceName}")
+            }
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.e("NsdManager", "Registration failed: $errorCode")
+            }
+            override fun onServiceUnregistered(info: NsdServiceInfo) {
+                Log.d("NsdManager", "Service unregistered")
+            }
+            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.e("NsdManager", "Unregistration failed: $errorCode")
+            }
+        }
+        
+        try {
+            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+        } catch (e: Exception) {
+            Log.e("NsdManager", "Failed to register NSD service: ${e.message}")
+        }
+        
         withContext(Dispatchers.IO) {
             while (isActive) {
                 try {
@@ -129,6 +188,7 @@ fun CameraScreen() {
                         val socket = serverSocket.accept()
                         clientSocket = socket
                         Log.d("TcpServer", "Client connected: ${socket.inetAddress}")
+                        isClientConnected = true
 
                         // disable Nagle
                         try {
@@ -213,6 +273,7 @@ fun CameraScreen() {
                         sendQueue.clear()
                         clientSocket?.close()
                         clientSocket = null
+                        isClientConnected = false
                     }
                 } catch (e: Exception) {
                     Log.e("TcpServer", "Server loop error: ${e.message}")
@@ -222,6 +283,7 @@ fun CameraScreen() {
                     Log.d("TcpServer", "Client disconnected. Waiting for a new client.")
                     clientSocket?.close()
                     clientSocket = null
+                    isClientConnected = false
                 }
             }
         }
@@ -234,10 +296,60 @@ fun CameraScreen() {
             senderRunning.set(false)
             senderThread?.interrupt()
             senderThread = null
+            
+            // Unregister NSD service
+            registrationListener?.let { listener ->
+                try {
+                    nsdManager.unregisterService(listener)
+                } catch (e: Exception) {
+                    Log.e("NsdManager", "Failed to unregister NSD service: ${e.message}")
+                }
+            }
         }
     }
 
-    LaunchedEffect(cameraProviderFuture) {
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            while (isActive) {
+                try {
+                    ServerSocket(8081).use { serverSocket ->
+                        Log.d("ControlServer", "Control server started on 8081")
+                        while (isActive) {
+                            val socket = serverSocket.accept()
+                            try {
+                                val reader = socket.getInputStream().bufferedReader()
+                                val cmd = reader.readLine()
+                                Log.d("ControlServer", "Received command: $cmd")
+                                
+                                if (cmd == "CMD:FLASH_TOGGLE") {
+                                    activeCamera?.let { cam ->
+                                        if (cam.cameraInfo.hasFlashUnit()) {
+                                            val currentTorchState = cam.cameraInfo.torchState.value ?: 0
+                                            cam.cameraControl.enableTorch(currentTorchState == 0)
+                                        }
+                                    }
+                                } else if (cmd == "CMD:CAM_SWITCH") {
+                                    lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) 
+                                        CameraSelector.LENS_FACING_FRONT 
+                                    else 
+                                        CameraSelector.LENS_FACING_BACK
+                                }
+                            } catch (e: Exception) {
+                                Log.e("ControlServer", "Command error: ${e.message}")
+                            } finally {
+                                try { socket.close() } catch (_: Exception) {}
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("ControlServer", "Control server error: ${e.message}")
+                    try { Thread.sleep(1000) } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(cameraProviderFuture, lensFacing) {
         val cameraProvider = cameraProviderFuture.get()
 
         // Setup H.264 encoder (buffer mode - no surface)
@@ -295,11 +407,11 @@ fun CameraScreen() {
                 }
             }
 
-        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
         try {
             cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
+            activeCamera = cameraProvider.bindToLifecycle(
                 lifecycleOwner,
                 cameraSelector,
                 preview,
@@ -318,7 +430,22 @@ fun CameraScreen() {
         }
     }
 
-    AndroidView({ previewView }, modifier = Modifier.fillMaxSize())
+    if (isClientConnected) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "Streaming Active\nScreen dimmed to save battery",
+                color = Color.Gray,
+                textAlign = TextAlign.Center
+            )
+        }
+    } else {
+        AndroidView({ previewView }, modifier = Modifier.fillMaxSize())
+    }
 }
 
 private class H264EncoderAnalyzer(
