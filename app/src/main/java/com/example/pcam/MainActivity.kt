@@ -42,6 +42,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material3.Text
 import android.view.WindowManager
+import androidx.compose.foundation.Image
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
@@ -444,7 +449,17 @@ fun CameraScreen() {
             )
         }
     } else {
-        AndroidView({ previewView }, modifier = Modifier.fillMaxSize())
+        Box(modifier = Modifier.fillMaxSize()) {
+            AndroidView({ previewView }, modifier = Modifier.fillMaxSize())
+            Image(
+                painter = painterResource(id = R.mipmap.ic_launcher),
+                contentDescription = "PCam Logo",
+                modifier = Modifier
+                    .padding(24.dp)
+                    .size(56.dp)
+                    .align(Alignment.TopStart)
+            )
+        }
     }
 }
 
