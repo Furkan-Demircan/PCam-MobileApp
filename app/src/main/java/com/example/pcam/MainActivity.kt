@@ -140,6 +140,12 @@ fun CameraScreen() {
     val sendQueue = remember { LinkedBlockingDeque<ByteArray>(48) }
     val senderRunning = remember { AtomicBoolean(false) }
     var senderThread by remember { mutableStateOf<Thread?>(null) }
+
+    // Signal from TCP server to encoder: a new client just connected,
+    // prepend cached SPS/PPS to the next keyframe.
+    val isNewClient = remember { AtomicBoolean(false) }
+    // Reference to the MediaCodec encoder so the TCP server can request sync frames
+    var mediaCodecRef by remember { mutableStateOf<MediaCodec?>(null) }
     
     // NsdManager variables
     val nsdManager = remember { context.getSystemService(Context.NSD_SERVICE) as NsdManager }
@@ -194,6 +200,20 @@ fun CameraScreen() {
                         clientSocket = socket
                         Log.d("TcpServer", "Client connected: ${socket.inetAddress}")
                         isClientConnected = true
+
+                        // Signal the encoder that a brand-new client needs SPS/PPS
+                        isNewClient.set(true)
+                        // Request an immediate keyframe so the client can start decoding ASAP
+                        mediaCodecRef?.let { codec ->
+                            try {
+                                val params = Bundle()
+                                params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                codec.setParameters(params)
+                                Log.d("TcpServer", "Requested sync frame from encoder for new client")
+                            } catch (e: Exception) {
+                                Log.w("TcpServer", "Failed to request sync frame: ${e.message}")
+                            }
+                        }
 
                         // disable Nagle
                         try {
@@ -370,6 +390,7 @@ fun CameraScreen() {
                 mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
                 mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 mediaCodec.start()
+                mediaCodecRef = mediaCodec
                 Log.d("MediaCodec", "H.264 encoder started: ${ENCODER_WIDTH}x${ENCODER_HEIGHT}@${ENCODER_FPS}fps")
             } catch (e: Exception) {
                 Log.e("MediaCodec", "Failed to create encoder: ${e.message}")
@@ -379,11 +400,15 @@ fun CameraScreen() {
         }
 
         // Simple preview (not shown, just for camera to work)
-        val preview = Preview.Builder().build()
+        // Lock to landscape rotation so CameraX doesn't auto-swap dimensions for portrait
+        val preview = Preview.Builder()
+            .setTargetRotation(android.view.Surface.ROTATION_90)
+            .build()
 
         // --- Camera Setup ---
         val imageAnalysisBuilder = ImageAnalysis.Builder()
             .setTargetResolution(Size(ENCODER_WIDTH, ENCODER_HEIGHT))
+            .setTargetRotation(android.view.Surface.ROTATION_90) // Force landscape output
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
 
         // Request target FPS
@@ -397,7 +422,7 @@ fun CameraScreen() {
             .also {
                 if (mediaCodec != null) {
                     // H.264 encoding path
-                    val analyzer = H264EncoderAnalyzer(mediaCodec, sendQueue)
+                    val analyzer = H264EncoderAnalyzer(mediaCodec, sendQueue, isNewClient)
                     it.setAnalyzer(Executors.newSingleThreadExecutor(), analyzer)
                 } else {
                     // JPEG fallback
@@ -465,7 +490,8 @@ fun CameraScreen() {
 
 private class H264EncoderAnalyzer(
     private val encoder: MediaCodec,
-    private val sendQueue: LinkedBlockingDeque<ByteArray>
+    private val sendQueue: LinkedBlockingDeque<ByteArray>,
+    private val isNewClient: AtomicBoolean
 ) : ImageAnalysis.Analyzer {
 
     private var frameCount = 0
@@ -649,11 +675,30 @@ private class H264EncoderAnalyzer(
                             val nalType = if (annexB.size >= 5) "${annexB[4].toInt() and 0x1F}" else "?"
                             Log.d("H264Encoder", "Sent keyframe (NAL $nalType) with SPS/PPS: ${keyframeData.size} bytes")
                         }
+                        // Clear the new-client flag after sending a keyframe with SPS/PPS
+                        isNewClient.compareAndSet(true, false)
                     } else {
                         // Regular frame (P-frame)
-                        if (!sendQueue.offer(annexB)) {
-                            sendQueue.poll()
-                            sendQueue.offer(annexB)
+                        // If a new client just connected, it MUST receive SPS/PPS+keyframe first.
+                        // Prepend cached config to the P-frame only if we have no keyframe yet
+                        // (the sync frame request should deliver a keyframe soon, but in case
+                        // P-frames arrive before it, we still need the client to get config data).
+                        if (isNewClient.get() && configData != null) {
+                            val combined = ByteArrayOutputStream()
+                            combined.write(configData)
+                            combined.write(annexB)
+                            val withConfig = combined.toByteArray()
+                            if (!sendQueue.offer(withConfig)) {
+                                sendQueue.poll()
+                                sendQueue.offer(withConfig)
+                            }
+                            isNewClient.set(false)
+                            Log.d("H264Encoder", "New client: prepended SPS/PPS to P-frame: ${withConfig.size} bytes")
+                        } else {
+                            if (!sendQueue.offer(annexB)) {
+                                sendQueue.poll()
+                                sendQueue.offer(annexB)
+                            }
                         }
                         // Log occasionally
                         if (frameCount % 120 == 0) {
