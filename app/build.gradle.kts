@@ -39,7 +39,13 @@ android {
         compose = true
     }
 
-
+    applicationVariants.all {
+        val variant = this
+        variant.outputs.all {
+            val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
+            output.outputFileName = "PCam_v${variant.versionName}.apk"
+        }
+    }
 }
 
 dependencies {
